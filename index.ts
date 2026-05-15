@@ -860,6 +860,31 @@ const BASE_HEADERS: Record<string, string> = {
 };
 
 /**
+ * GITLAB_CUSTOM_HEADERS: optional JSON map of extra HTTP headers to send on every
+ * outbound request to the GitLab API. Useful when GitLab sits behind a reverse proxy
+ * that requires per-request headers (e.g. Cloudflare Access service tokens).
+ * Example: GITLAB_CUSTOM_HEADERS='{"CF-Access-Client-Id":"foo","CF-Access-Client-Secret":"bar"}'
+ * Malformed JSON is silently ignored. Auth headers built by buildAuthHeaders() always win.
+ */
+const GITLAB_CUSTOM_HEADERS: Record<string, string> = (() => {
+  const raw = process.env.GITLAB_CUSTOM_HEADERS;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "string") out[k] = v;
+      }
+      return out;
+    }
+  } catch {
+    /* ignore malformed env var */
+  }
+  return {};
+})();
+
+/**
  * Build authentication headers dynamically based on context
  * In REMOTE_AUTHORIZATION or GITLAB_MCP_OAUTH mode, reads from AsyncLocalStorage session context
  * Otherwise, uses environment token (OAuth token is refreshed lazily before each tool call)
@@ -929,7 +954,8 @@ const getFetchConfig = () => {
   const agent = clientPool.getAgentFunctionForUrl(effectiveApiUrl);
 
   return {
-    headers: { ...BASE_HEADERS, ...buildAuthHeaders() },
+    // Auth headers come last so they always win over operator-provided custom headers.
+    headers: { ...BASE_HEADERS, ...GITLAB_CUSTOM_HEADERS, ...buildAuthHeaders() },
     agent: agent,
   };
 };
