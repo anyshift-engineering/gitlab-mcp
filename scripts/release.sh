@@ -20,6 +20,112 @@ fi
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 echo "Current version: $CURRENT_VERSION"
 
+git fetch --tags origin >/dev/null 2>&1 || true
+
+tag_exists() {
+  git rev-parse -q --verify "refs/tags/$1" >/dev/null
+}
+
+sync_registry_metadata_version() {
+  local version="$1"
+
+  if [ ! -f server.json ]; then
+    return
+  fi
+
+  node - "$version" <<'NODE'
+const fs = require("fs");
+const version = process.argv[2];
+const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+const serverJson = JSON.parse(fs.readFileSync("server.json", "utf8"));
+
+serverJson.version = version;
+for (const pkg of serverJson.packages || []) {
+  if (!pkg.identifier || pkg.identifier === packageJson.name) {
+    pkg.version = version;
+  }
+}
+
+fs.writeFileSync("server.json", `${JSON.stringify(serverJson, null, 2)}\n`);
+NODE
+}
+
+# Pin README/docs npx examples to the PREVIOUS stable release, not the version
+# being cut right now: a freshly released version has not been proven in the
+# wild yet, so new users get the last known-good release by default. Users who
+# always want the newest can use @latest (documented in the READMEs).
+sync_pinned_npx_docs_version() {
+  local version="$1"
+
+  if [ -z "$version" ]; then
+    echo "⚠️  No previous release tag found; leaving pinned docs version unchanged."
+    return
+  fi
+
+  # Git tags can outpace npm when publish fails; pin must exist on the registry.
+  if ! npm view "@zereight/mcp-gitlab@${version}" version >/dev/null 2>&1; then
+    local npm_pin
+    npm_pin=$(
+      npm view @zereight/mcp-gitlab versions --json 2>/dev/null | node -e '
+const wanted = process.argv[1];
+let raw = "";
+process.stdin.on("data", (c) => (raw += c));
+process.stdin.on("end", () => {
+  const versions = JSON.parse(raw);
+  const pin = [...versions].reverse().find(
+    (v) => v.localeCompare(wanted, undefined, { numeric: true }) < 0
+  );
+  if (!pin) process.exit(1);
+  process.stdout.write(pin);
+});
+' "$version"
+    ) || true
+    if [ -n "$npm_pin" ]; then
+      echo "⚠️  @$version is not on npm; pinning docs to @$npm_pin instead."
+      version="$npm_pin"
+    else
+      echo "⚠️  Could not resolve an npm-published pin for @$version; leaving docs unchanged."
+      return
+    fi
+  fi
+
+  node - "$version" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const version = process.argv[2];
+const roots = ["README.md", "README.ko.md", "README.zh-CN.md", "docs"];
+
+function files(root) {
+  if (!fs.existsSync(root)) return [];
+  const stat = fs.statSync(root);
+  if (stat.isFile()) return root.endsWith(".md") ? [root] : [];
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const next = path.join(root, entry.name);
+    if (entry.isDirectory()) return files(next);
+    return entry.isFile() && next.endsWith(".md") ? [next] : [];
+  });
+}
+
+for (const file of roots.flatMap(files)) {
+  const before = fs.readFileSync(file, "utf8");
+  const after = before.replace(/@zereight\/mcp-gitlab@\d+\.\d+\.\d+/g, `@zereight/mcp-gitlab@${version}`);
+  if (after !== before) fs.writeFileSync(file, after);
+}
+NODE
+}
+
+preflight_registry_metadata() {
+  if [ ! -f server.json ]; then
+    return
+  fi
+
+  npm run release:mcp-registry -- --check
+}
+
+build_docs() {
+  make docs
+}
+
 # Determine the previous tag for changelog
 get_previous_tag() {
   local current_tag="$1"
@@ -59,6 +165,106 @@ get_merged_prs() {
   echo "$commits" | grep -oE '#[0-9]+' | sed 's/#//' | sort -u
 }
 
+format_contributors() {
+  local range="$1"
+  local limit="$2"
+  
+  git shortlog -sne "$range" | head -n "$limit" | awk '
+    {
+      count = $1
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+      name = $0
+      email = ""
+      if (match(name, /<[^>]+>$/)) {
+        email = substr(name, RSTART + 1, RLENGTH - 2)
+      }
+      sub(/[[:space:]]*<[^>]+>[[:space:]]*$/, "", name)
+      mention = name
+      if (email ~ /^[0-9]+\+[^@]+@users\.noreply\.github\.com$/) {
+        mention = email
+        sub(/^[0-9]+\+/, "", mention)
+        sub(/@users\.noreply\.github\.com$/, "", mention)
+        mention = "@" mention
+      } else if (email ~ /^[^@]+@users\.noreply\.github\.com$/) {
+        mention = email
+        sub(/@users\.noreply\.github\.com$/, "", mention)
+        mention = "@" mention
+      } else {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", mention)
+        gsub(/[^A-Za-z0-9-]/, "-", mention)
+        gsub(/-+/, "-", mention)
+        gsub(/^-|-$/, "", mention)
+        if (mention != "") {
+          mention = "@" mention
+        }
+      }
+      if (mention != "") {
+        suffix = count == 1 ? "commit" : "commits"
+        printf "- %s (%s %s)\n", mention, count, suffix
+      }
+    }
+  '
+}
+
+format_pr_contributors() {
+  local pr_numbers="$1"
+  local fallback_range="$2"
+  local limit="$3"
+
+  if [ -z "$pr_numbers" ]; then
+    format_contributors "$fallback_range" "$limit"
+    return
+  fi
+
+  local contributors
+  contributors=$(
+    while IFS= read -r pr_num; do
+      if [ -z "$pr_num" ]; then
+        continue
+      fi
+
+      local pr_data
+      pr_data=$(gh api "repos/$REPO_OWNER/$REPO_NAME/pulls/$pr_num" 2>/dev/null || true)
+      if [ -z "$pr_data" ]; then
+        continue
+      fi
+
+      local login
+      login=$(echo "$pr_data" | jq -r '.user.login // empty' 2>/dev/null || true)
+      if [ -z "$login" ]; then
+        continue
+      fi
+
+      printf "%s\t#%s\n" "$login" "$pr_num"
+    done <<< "$pr_numbers" |
+      awk -F '\t' '
+        {
+          count[$1]++
+          prs[$1] = prs[$1] ? prs[$1] ", " $2 : $2
+        }
+        END {
+          for (login in count) {
+            printf "%s\t%s\t%s\n", count[login], login, prs[login]
+          }
+        }
+        ' |
+        sort -k1,1nr -k2,2 |
+        head -n "$limit" |
+      awk -F '\t' '
+        {
+          suffix = $1 == 1 ? "PR" : "PRs"
+          printf "- @%s (%s %s: %s)\n", $2, $1, suffix, $3
+        }
+      '
+  )
+
+  if [ -n "$contributors" ]; then
+    echo "$contributors"
+  else
+    format_contributors "$fallback_range" "$limit"
+  fi
+}
+
 # Generate CHANGELOG-style release notes
 generate_changelog_notes() {
   local version="$1"
@@ -69,7 +275,12 @@ generate_changelog_notes() {
   # Get all commits since previous tag
   local commits
   if [ -n "$previous_tag" ]; then
-    commits=$(git log "$previous_tag"..HEAD --oneline 2>/dev/null || git log --oneline -50)
+    if ! tag_exists "$previous_tag"; then
+      echo "❌ Release notes base tag $previous_tag does not exist locally." >&2
+      echo "Run git fetch --tags origin and retry." >&2
+      exit 1
+    fi
+    commits=$(git log "$previous_tag"..HEAD --oneline)
   else
     commits=$(git log --oneline -50)
   fi
@@ -169,11 +380,37 @@ generate_changelog_notes() {
     notes+="### Other Changes\n$other\n"
   fi
   
-  # Add contributors section
-  notes+="\n### Contributors\n"
-  notes+="$(git shortlog -sne HEAD | head -10)\n"
+  # Add contributors section (scoped to this release range)
+  local contributors
+  local contributor_range
+  local contributor_limit
+  if [ -n "$previous_tag" ]; then
+    contributor_range="$previous_tag..HEAD"
+    contributor_limit=10
+  else
+    contributor_range="HEAD"
+    contributor_limit=20
+  fi
+
+  contributors=$(format_pr_contributors "$pr_numbers" "$contributor_range" "$contributor_limit")
+  
+  if [ -n "$contributors" ]; then
+    notes+="\n### Contributors\n$contributors\n"
+  fi
   
   echo -e "$notes"
+}
+
+# True when commits after $1 mention a PR (#123). Empty base → recent history.
+commits_mention_prs() {
+  local since_tag="$1"
+  local commits
+  if [ -n "$since_tag" ]; then
+    commits=$(git log "$since_tag"..HEAD --format="%s" 2>/dev/null || echo "")
+  else
+    commits=$(git log --oneline -50 --format="%s" 2>/dev/null || echo "")
+  fi
+  echo "$commits" | grep -qE '#[0-9]+'
 }
 
 # Check if the current version tag already exists locally
@@ -189,19 +426,37 @@ if [ -n "$LOCAL_TAG_EXISTS" ] && [ -z "$REMOTE_TAG_EXISTS" ]; then
   PREV_TAG=$(get_previous_tag "v$CURRENT_VERSION")
   
 elif [ -n "$REMOTE_TAG_EXISTS" ]; then
-  # Tag already exists on remote - bump patch and release new version
+  # Tag already exists on remote. Only bump when HEAD actually moved past it —
+  # otherwise a second release.sh run creates an empty patch (blank notes).
+  COMMITS_SINCE_TAG=$(git rev-list --count "v${CURRENT_VERSION}..HEAD" 2>/dev/null || echo 0)
+  if [ "$COMMITS_SINCE_TAG" = "0" ]; then
+    echo "✅ Tag v$CURRENT_VERSION already exists on remote and HEAD has no new commits."
+    echo "   Refusing empty patch bump (would produce blank release notes)."
+    exit 0
+  fi
+  if ! commits_mention_prs "v${CURRENT_VERSION}"; then
+    echo "❌ Commits since v$CURRENT_VERSION have no PR references (#N)."
+    echo "   Refusing release that would produce blank categorized notes."
+    exit 1
+  fi
+
   echo "⚠️  Tag v$CURRENT_VERSION already exists on remote. Bumping patch version..."
   PREV_TAG="v$CURRENT_VERSION"
-
-  # Delete local tag if it exists (to avoid conflict with new tag)
-  git tag -d "v$CURRENT_VERSION" 2>/dev/null || true
 
   npm version patch --no-git-tag-version
 
   NEW_VERSION=$(node -p "require('./package.json').version")
   echo "New version: $NEW_VERSION"
 
-  git add package.json package-lock.json
+  sync_registry_metadata_version "$NEW_VERSION"
+  sync_pinned_npx_docs_version "${PREV_TAG#v}"
+  preflight_registry_metadata
+  build_docs
+
+  git add -u package.json package-lock.json README.md README.ko.md README.zh-CN.md docs
+  if [ -f server.json ]; then
+    git add server.json
+  fi
   git commit -m "chore(release): v$NEW_VERSION"
 
   git tag "v$NEW_VERSION"
@@ -210,12 +465,26 @@ else
   # No existing tag - create new version bump
   PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 
+  if ! commits_mention_prs "$PREV_TAG"; then
+    echo "❌ Commits since ${PREV_TAG:-start} have no PR references (#N)."
+    echo "   Refusing release that would produce blank categorized notes."
+    exit 1
+  fi
+
   npm version patch --no-git-tag-version
 
   NEW_VERSION=$(node -p "require('./package.json').version")
   echo "New version: $NEW_VERSION"
 
-  git add package.json package-lock.json
+  sync_registry_metadata_version "$NEW_VERSION"
+  sync_pinned_npx_docs_version "${PREV_TAG#v}"
+  preflight_registry_metadata
+  build_docs
+
+  git add -u package.json package-lock.json README.md README.ko.md README.zh-CN.md docs
+  if [ -f server.json ]; then
+    git add server.json
+  fi
   git commit -m "chore(release): v$NEW_VERSION"
 
   git tag "v$NEW_VERSION"

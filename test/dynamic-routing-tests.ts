@@ -41,7 +41,7 @@ describe('Dynamic Routing and Authentication Scenarios', () => {
       // to avoid launchServer overwriting GITLAB_PERSONAL_ACCESS_TOKEN with a different value
       process.env.GITLAB_TOKEN_TEST = MOCK_TOKEN_DEFAULT;
       process.env.TEST_PROJECT_ID = '1';
-      const mockPort = await findMockServerPort(9021);
+      const mockPort = await findMockServerPort();
       mockServer = new MockGitLabServer({ port: mockPort, validTokens: [MOCK_TOKEN_DEFAULT] });
       await mockServer.start();
 
@@ -97,7 +97,7 @@ describe('Dynamic Routing and Authentication Scenarios', () => {
     let mockServer: MockGitLabServer;
 
     before(async () => {
-      const mockPort = await findMockServerPort(9022);
+      const mockPort = await findMockServerPort();
       mockServer = new MockGitLabServer({ port: mockPort, validTokens: [MOCK_TOKEN_HEADER] });
       await mockServer.start();
 
@@ -169,11 +169,11 @@ describe('Dynamic Routing and Authentication Scenarios', () => {
     let headerMockServer: MockGitLabServer;
 
     before(async () => {
-      const defaultPort = await findMockServerPort(9024);
+      const defaultPort = await findMockServerPort();
       defaultMockServer = new MockGitLabServer({ port: defaultPort, validTokens: [MOCK_TOKEN_DEFAULT, MOCK_TOKEN_HEADER] });
       await defaultMockServer.start();
 
-      const headerPort = await findMockServerPort(9025);
+      const headerPort = await findMockServerPort();
       headerMockServer = new MockGitLabServer({ port: headerPort, validTokens: [MOCK_TOKEN_DEFAULT, MOCK_TOKEN_HEADER] });
       await headerMockServer.start();
 
@@ -259,6 +259,63 @@ describe('Dynamic Routing and Authentication Scenarios', () => {
       await client.connect(mcpUrl);
       
       await validateToolCalls(client, headerMockServer, MOCK_TOKEN_HEADER);
+
+      await client.disconnect();
+    });
+
+    test('should preserve legacy tree array response and return keyset metadata when requested', async () => {
+      const client = new CustomHeaderClient({
+        headers: {
+          'authorization': `Bearer ${MOCK_TOKEN_HEADER}`,
+          'X-GitLab-API-URL': `${headerMockServer.getUrl()}/api/v4`,
+        }
+      });
+      await client.connect(mcpUrl);
+
+      headerMockServer.clearCustomHandlers();
+      headerMockServer.addMockHandler('get', '/projects/4/repository/tree', (req: Request, res: Response) => {
+        assert.strictEqual(req.headers['authorization'], `Bearer ${MOCK_TOKEN_HEADER}`);
+        assert.strictEqual(req.query.pagination, undefined);
+        res.json([createMockTreeItem('legacy-blob')]);
+      });
+
+      const legacyResult = await client.callTool('get_repository_tree', { project_id: '4' });
+      const legacyContent = JSON.parse((legacyResult.content[0] as any).text);
+      assert.ok(Array.isArray(legacyContent));
+      assert.strictEqual(legacyContent[0].id, 'legacy-blob');
+
+      headerMockServer.clearCustomHandlers();
+      headerMockServer.addMockHandler('get', '/projects/4/repository/tree', (req: Request, res: Response) => {
+        assert.strictEqual(req.headers['authorization'], `Bearer ${MOCK_TOKEN_HEADER}`);
+        assert.strictEqual(req.query.pagination, 'keyset');
+        res.set('x-next-page-token', 'token-blob');
+        res.json([createMockTreeItem('keyset-blob')]);
+      });
+
+      const keysetResult = await client.callTool('get_repository_tree', {
+        project_id: '4',
+        pagination: 'keyset',
+      });
+      const keysetContent = JSON.parse((keysetResult.content[0] as any).text);
+      assert.ok(!Array.isArray(keysetContent));
+      assert.strictEqual(keysetContent.items[0].id, 'keyset-blob');
+      assert.strictEqual(keysetContent.next_page_token, 'token-blob');
+
+      headerMockServer.clearCustomHandlers();
+      headerMockServer.addMockHandler('get', '/projects/4/repository/tree', (req: Request, res: Response) => {
+        assert.strictEqual(req.headers['authorization'], `Bearer ${MOCK_TOKEN_HEADER}`);
+        assert.strictEqual(req.query.pagination, 'keyset');
+        res.set('x-next-page', 'fallback-token');
+        res.json([createMockTreeItem('fallback-blob')]);
+      });
+
+      const fallbackResult = await client.callTool('get_repository_tree', {
+        project_id: '4',
+        pagination: 'keyset',
+      });
+      const fallbackContent = JSON.parse((fallbackResult.content[0] as any).text);
+      assert.strictEqual(fallbackContent.items[0].id, 'fallback-blob');
+      assert.strictEqual(fallbackContent.next_page_token, 'fallback-token');
 
       await client.disconnect();
     });
@@ -409,7 +466,7 @@ async function validateToolCalls(client: CustomHeaderClient, mockServer: MockGit
     { name: 'get_merge_request', params: { project_id: '1', merge_request_iid: '1' } },
     { name: 'list_merge_requests', params: { project_id: '1' } },
     { name: 'get_repository_tree', params: { project_id: '1' } },
-    { name: 'list_labels', params: { project_id: '1' } },
+    { name: 'list_labels', params: { project_id: '1', page: 2, per_page: 50 } },
     { name: 'list_pipelines', params: { project_id: '1' } },
     { name: 'list_commits', params: { project_id: '1' } },
   ];
@@ -462,6 +519,10 @@ async function validateToolCalls(client: CustomHeaderClient, mockServer: MockGit
         assert.strictEqual(req.headers['authorization'], `Bearer ${expectedToken}`);
       } else {
         assert.strictEqual(req.headers['private-token'], expectedToken);
+      }
+      if (tool.name === 'list_labels') {
+        assert.strictEqual(req.query.page, '2');
+        assert.strictEqual(req.query.per_page, '50');
       }
       res.json(mockResponse);
     });

@@ -1,4 +1,4 @@
-import { describe, test, before, after } from 'node:test';
+import { describe, test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -76,6 +76,8 @@ const MOCK_UPLOAD_RESPONSE = {
   markdown: '[test-file.txt](/uploads/abc123secret/test-file.txt)',
 };
 
+let uploadResponse: Record<string, unknown> = MOCK_UPLOAD_RESPONSE;
+
 describe('upload_markdown', () => {
   let mockGitLab: MockGitLabServer;
   let env: NodeJS.ProcessEnv;
@@ -84,8 +86,14 @@ describe('upload_markdown', () => {
   let lastContentType: string | undefined;
   let lastRawBody: string | undefined;
 
+  beforeEach(() => {
+    uploadResponse = MOCK_UPLOAD_RESPONSE;
+    lastContentType = undefined;
+    lastRawBody = undefined;
+  });
+
   before(async () => {
-    const port = await findMockServerPort(9200);
+    const port = await findMockServerPort();
     mockGitLab = new MockGitLabServer({ port, validTokens: [MOCK_TOKEN] });
     await mockGitLab.start();
 
@@ -103,7 +111,7 @@ describe('upload_markdown', () => {
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
         req.on('end', () => {
           lastRawBody = Buffer.concat(chunks).toString('binary');
-          res.status(201).json(MOCK_UPLOAD_RESPONSE);
+          res.status(201).json(uploadResponse);
         });
       }
     );
@@ -114,7 +122,7 @@ describe('upload_markdown', () => {
   });
 
   test('Content-Type is multipart/form-data with a boundary', async () => {
-    const tmpFile = path.join(os.tmpdir(), 'mcp-upload-ct-test.txt');
+    const tmpFile = `mcp-upload-ct-test-${process.pid}.txt`;
     fs.writeFileSync(tmpFile, 'content-type test');
     try {
       await callUploadMarkdown({ project_id: TEST_PROJECT_ID, file_path: tmpFile }, env);
@@ -134,7 +142,7 @@ describe('upload_markdown', () => {
   });
 
   test('multipart body contains a "file" field with the file content', async () => {
-    const tmpFile = path.join(os.tmpdir(), 'mcp-upload-body-test.txt');
+    const tmpFile = `mcp-upload-body-test-${process.pid}.txt`;
     const fileContent = 'hello from multipart upload test';
     fs.writeFileSync(tmpFile, fileContent);
     try {
@@ -155,14 +163,14 @@ describe('upload_markdown', () => {
   });
 
   test('multipart body includes the original filename', async () => {
-    const tmpFile = path.join(os.tmpdir(), 'mcp-upload-filename-check.txt');
+    const tmpFile = `mcp-upload-filename-check-${process.pid}.txt`;
     fs.writeFileSync(tmpFile, 'filename check');
     try {
       await callUploadMarkdown({ project_id: TEST_PROJECT_ID, file_path: tmpFile }, env);
 
       assert.ok(lastRawBody, 'Request body must be captured');
       assert.ok(
-        lastRawBody!.includes('mcp-upload-filename-check.txt'),
+        lastRawBody!.includes(`mcp-upload-filename-check-${process.pid}.txt`),
         'Multipart body should include the original filename'
       );
     } finally {
@@ -171,7 +179,7 @@ describe('upload_markdown', () => {
   });
 
   test('returns markdown, url, alt, and full_path from upload response', async () => {
-    const tmpFile = path.join(os.tmpdir(), 'mcp-upload-response-test.txt');
+    const tmpFile = `mcp-upload-response-test-${process.pid}.txt`;
     fs.writeFileSync(tmpFile, 'response field test');
     try {
       const raw = await callUploadMarkdown({ project_id: TEST_PROJECT_ID, file_path: tmpFile }, env);
@@ -190,9 +198,33 @@ describe('upload_markdown', () => {
     }
   });
 
+  test('accepts upload responses without id from older self-hosted GitLab', async () => {
+    const { id: _id, ...idlessUploadResponse } = MOCK_UPLOAD_RESPONSE;
+    uploadResponse = idlessUploadResponse;
+
+    const tmpFile = `mcp-upload-idless-response-test-${process.pid}.txt`;
+    fs.writeFileSync(tmpFile, 'idless response field test');
+    try {
+      const raw = await callUploadMarkdown({ project_id: TEST_PROJECT_ID, file_path: tmpFile }, env);
+
+      assert.ok(!raw.error, `Unexpected RPC error: ${raw.error?.message}`);
+      const text = raw.result?.content?.[0]?.text;
+      assert.ok(text, 'Result should contain a text content block');
+
+      const parsed = JSON.parse(text);
+      assert.strictEqual(parsed.id, undefined);
+      assert.strictEqual(parsed.markdown, MOCK_UPLOAD_RESPONSE.markdown);
+      assert.strictEqual(parsed.url, MOCK_UPLOAD_RESPONSE.url);
+      assert.strictEqual(parsed.alt, MOCK_UPLOAD_RESPONSE.alt);
+      assert.strictEqual(parsed.full_path, MOCK_UPLOAD_RESPONSE.full_path);
+    } finally {
+      fs.unlinkSync(tmpFile);
+    }
+  });
+
   test('returns an error when the file does not exist', async () => {
     const raw = await callUploadMarkdown(
-      { project_id: TEST_PROJECT_ID, file_path: '/nonexistent/no-such-file.txt' },
+      { project_id: TEST_PROJECT_ID, file_path: `mcp-upload-missing-${process.pid}.txt` },
       env
     );
 
@@ -202,5 +234,61 @@ describe('upload_markdown', () => {
         c => c.text && (c.text.toLowerCase().includes('not found') || c.text.toLowerCase().includes('error'))
       );
     assert.ok(hasError, 'Should return an error for a nonexistent file path');
+  });
+
+  test('rejects absolute file_path (path traversal / arbitrary read)', async () => {
+    const raw = await callUploadMarkdown(
+      { project_id: TEST_PROJECT_ID, file_path: '/etc/passwd' },
+      env
+    );
+
+    const msg =
+      (typeof raw.error?.message === 'string' ? raw.error.message : '') +
+      (raw.result?.content?.map(c => c.text || '').join(' ') || '');
+    assert.ok(
+      msg.toLowerCase().includes('traversal') || msg.toLowerCase().includes('invalid'),
+      `Expected traversal rejection, got: ${msg}`
+    );
+  });
+
+  test('rejects file_path with ".." traversal', async () => {
+    const raw = await callUploadMarkdown(
+      { project_id: TEST_PROJECT_ID, file_path: '../../../etc/passwd' },
+      env
+    );
+
+    const msg =
+      (typeof raw.error?.message === 'string' ? raw.error.message : '') +
+      (raw.result?.content?.map(c => c.text || '').join(' ') || '');
+    assert.ok(
+      msg.toLowerCase().includes('traversal') || msg.toLowerCase().includes('invalid'),
+      `Expected traversal rejection, got: ${msg}`
+    );
+  });
+
+  test('rejects file_path that is a symlink escape', async () => {
+    const linkName = `mcp-upload-symlink-${process.pid}.txt`;
+    const target = path.join(os.tmpdir(), `mcp-upload-secret-${process.pid}.txt`);
+    fs.writeFileSync(target, 'secret-content');
+    fs.symlinkSync(target, linkName);
+    try {
+      const raw = await callUploadMarkdown(
+        { project_id: TEST_PROJECT_ID, file_path: linkName },
+        env
+      );
+      const msg =
+        (typeof raw.error?.message === 'string' ? raw.error.message : '') +
+        (raw.result?.content?.map(c => c.text || '').join(' ') || '');
+      assert.ok(
+        msg.toLowerCase().includes('symbolic') ||
+          msg.toLowerCase().includes('symlink') ||
+          msg.toLowerCase().includes('escapes') ||
+          msg.toLowerCase().includes('invalid'),
+        `Expected symlink rejection, got: ${msg}`
+      );
+    } finally {
+      fs.rmSync(linkName, { force: true });
+      fs.rmSync(target, { force: true });
+    }
   });
 });

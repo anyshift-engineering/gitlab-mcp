@@ -5,23 +5,60 @@ on:
     types: [published]
 
 permissions:
-  id-token: write
   contents: read
+  id-token: none
 
 jobs:
   npm:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.21.1'
-          registry-url: 'https://registry.npmjs.org/'
-      - name: Upgrade npm for OIDC support
-        run: npm install -g npm@latest
+          node-version: "22.22.2"
+          registry-url: "https://registry.npmjs.org/"
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
+      - name: Build
+        run: npm run build
+      # Trusted publishing needs npm >= 11.5. Avoid `npm install -g` (breaks arborist on this image).
       - name: Publish to npm
-        run: npm publish --access public
+        run: npx --yes npm@11.5.2 publish --access public --provenance
+
+  sync-homebrew:
+    needs: npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+
+      - name: Sync formula from npm tarball
+        run: bash scripts/sync-homebrew-formula.sh
+
+      # main is PR-protected; do not push with git-auto-commit-action.
+      - name: Open Homebrew formula PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          base: main
+          branch: automation/homebrew-formula
+          title: "chore(homebrew): sync formula for release"
+          commit-message: "chore(homebrew): sync formula for release"
+          body: "Automated Homebrew formula sync after npm publish."
+          add-paths: Formula/zereight-mcp-gitlab.rb

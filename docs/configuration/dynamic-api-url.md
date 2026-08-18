@@ -22,6 +22,7 @@ The server uses a connection pool (`GitLabClientPool`) to manage HTTP/HTTPS agen
 In remote authorization mode, each session can have its own GitLab API URL:
 
 - The API URL is extracted from the `X-GitLab-API-URL` header
+- Its host must match `GITLAB_API_URL` or `GITLAB_ALLOWED_HOSTS`
 - It's stored alongside the authentication token in the session context
 - All API calls within that session use the specified API URL
 
@@ -38,6 +39,9 @@ ENABLE_DYNAMIC_API_URL=true
 # Remote authorization must be enabled for this feature
 REMOTE_AUTHORIZATION=true
 STREAMABLE_HTTP=true
+
+# Additional trusted GitLab hosts (optional; GITLAB_API_URL hosts are always allowed)
+GITLAB_ALLOWED_HOSTS=gitlab.example.com,gitlab.company.com:8443
 
 # Connection pool configuration (optional)
 GITLAB_POOL_MAX_SIZE=100              # Maximum number of GitLab instances in pool (default: 100)
@@ -89,7 +93,7 @@ X-GitLab-API-URL: https://gitlab.example.com
 | Header | Required | Description |
 |--------|----------|-------------|
 | `Authorization` or `Private-Token` | Yes | GitLab authentication token |
-| `X-GitLab-API-URL` | Yes* | Full URL to GitLab API (e.g., `https://gitlab.example.com`) |
+| `X-GitLab-API-URL` | Yes* | Full URL to an allowed GitLab API host (e.g., `https://gitlab.example.com`) |
 | `MCP-Session-ID` | Yes** | Session identifier for maintaining state |
 
 \* Required when `ENABLE_DYNAMIC_API_URL=true`  
@@ -220,13 +224,19 @@ curl -X POST http://localhost:3002/mcp \
 
 ### Pool Statistics
 
-You can monitor the connection pool via the metrics endpoint:
+Prometheus can scrape the metrics endpoint directly:
 
 ```bash
 curl http://localhost:3002/metrics
 ```
 
-Response:
+JSON metrics remain available for scripts:
+
+```bash
+curl http://localhost:3002/metrics.json
+```
+
+JSON response:
 ```json
 {
   "activeSessions": 5,
@@ -269,9 +279,12 @@ Response:
 
 ### Rate Limiting
 
-- Each session is subject to rate limiting (`MAX_REQUESTS_PER_MINUTE`)
+- `/mcp` requests are limited per client IP (`MAX_REQUESTS_PER_MINUTE`, default 60)
+- OAuth and remote-authorization sessions have an additional per-session limit (same env var)
+- Download proxy routes (`/downloads/*`) are limited per auth token (same env var)
+- Behind a reverse proxy, set `MCP_TRUST_PROXY=true` so the IP limit keys on real clients
 - The connection pool has a maximum size (`GITLAB_POOL_MAX_SIZE`)
-- Requests are rejected when limits are exceeded
+- Requests are rejected with HTTP 429 when limits are exceeded
 
 ### SSL/TLS
 
@@ -296,8 +309,9 @@ Response:
    - Wait for idle connections to be cleaned up or increase `GITLAB_POOL_MAX_SIZE`
 
 4. **"Rate limit exceeded"**
-   - You've exceeded `MAX_REQUESTS_PER_MINUTE` for your session
-   - Wait for the rate limit window to reset (1 minute)
+   - You've exceeded `MAX_REQUESTS_PER_MINUTE` for your client IP, MCP session, or download token
+   - Behind a shared proxy without `MCP_TRUST_PROXY=true`, all users share one IP bucket
+   - Wait for the rate limit window to reset (1 minute), or raise the limit and enable `MCP_TRUST_PROXY`
 
 ### Debug Logging
 
@@ -347,9 +361,10 @@ For 100 clients: ~500 KB - 1 MB
    ENABLE_DYNAMIC_API_URL=true
    REMOTE_AUTHORIZATION=true
    STREAMABLE_HTTP=true
+   GITLAB_ALLOWED_HOSTS=gitlab.example.com,gitlab.company.com:8443
    ```
 
-2. **Update client code** to include `X-GitLab-API-URL` header
+2. **Update client code** to include `X-GitLab-API-URL` header for allowed hosts only
 
 3. **Test with a single instance** first to ensure compatibility
 
@@ -377,14 +392,16 @@ Specifies the GitLab API URL for the current request.
 
 **Validation**:
 - Must be a valid HTTP/HTTPS URL
+- Host must match one configured `GITLAB_API_URL` host or `GITLAB_ALLOWED_HOSTS`
 - Automatically normalized to include `/api/v4` suffix
-- Logged as warning if invalid
+- Logged as warning if invalid or not allowed
 
 ### Environment Variables
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `ENABLE_DYNAMIC_API_URL` | boolean | `false` | Enable dynamic API URL support |
+| `GITLAB_ALLOWED_HOSTS` | string | hosts from `GITLAB_API_URL` | Comma-separated additional allowed hosts for `X-GitLab-API-URL` |
 | `GITLAB_POOL_MAX_SIZE` | number | `100` | Maximum number of GitLab instances in pool |
 | `GITLAB_POOL_IDLE_TIMEOUT` | number | `300000` | Idle timeout in milliseconds |
 | `GITLAB_POOL_CLEANUP_INTERVAL` | number | `60000` | Cleanup interval in milliseconds |

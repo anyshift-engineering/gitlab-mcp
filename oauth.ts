@@ -5,14 +5,15 @@ import * as path from "path";
 import * as http from "http";
 import * as net from "net";
 import * as url from "url";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import open from "open";
 import pkceChallenge from "pkce-challenge";
-import { pino } from "pino";
+import { createLogger } from "./utils/logger.js";
 
-const logger = pino({
-  name: "gitlab-mcp-oauth",
-  level: process.env.LOG_LEVEL || "info",
-}, pino.destination(2));
+const logger = createLogger("gitlab-mcp-oauth");
+
+const execFileAsync = promisify(execFile);
 
 function escapeHtml(str: string): string {
   const map: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -44,6 +45,7 @@ interface OAuthConfig {
   gitlabUrl: string;
   scopes: string[];
   tokenStoragePath?: string;
+  tokenScript?: string;
 }
 
 /**
@@ -259,7 +261,7 @@ export class GitLabOAuth {
       );
       logger.info(`Token saved to ${this.tokenStoragePath}`);
     } catch (error) {
-      logger.error("Failed to save token:", error);
+      logger.error({ err: error }, "Failed to save token");
       throw error;
     }
   }
@@ -276,7 +278,7 @@ export class GitLabOAuth {
       const data = fs.readFileSync(this.tokenStoragePath, "utf8");
       return JSON.parse(data) as TokenData;
     } catch (error) {
-      logger.error("Failed to load token:", error);
+      logger.error({ err: error }, "Failed to load token");
       return null;
     }
   }
@@ -311,7 +313,7 @@ export class GitLabOAuth {
       try {
         return await requestAuthFromExistingServer(callbackPort, requestId);
       } catch (error) {
-        logger.error("Failed to connect to existing OAuth server:", error);
+        logger.error({ err: error }, "Failed to connect to existing OAuth server");
         throw new Error(
           `Port ${callbackPort} is in use but cannot connect to existing OAuth server. Please close other instances or use a different port.`
         );
@@ -375,7 +377,7 @@ export class GitLabOAuth {
             logger.info("Opening browser for new authentication request...");
             logger.info(`If browser doesn't open, visit: ${authUrl}`);
             open(authUrl).catch(err => {
-              logger.error("Failed to open browser:", err);
+              logger.error({ err }, "Failed to open browser");
               logger.info(`Please manually open: ${authUrl}`);
             });
 
@@ -531,7 +533,7 @@ export class GitLabOAuth {
             res.end("Not Found");
           }
         } catch (error) {
-          logger.error("Error handling request:", error);
+          logger.error({ err: error }, "Error handling request");
           res.writeHead(500, { "Content-Type": "text/plain" });
           res.end("Internal Server Error");
         }
@@ -543,13 +545,13 @@ export class GitLabOAuth {
         logger.info("Opening browser for authentication...");
         logger.info(`If browser doesn't open, visit: ${authUrl}`);
         open(authUrl).catch(err => {
-          logger.error("Failed to open browser:", err);
+          logger.error({ err }, "Failed to open browser");
           logger.info(`Please manually open: ${authUrl}`);
         });
       });
 
       server.on("error", error => {
-        logger.error("OAuth server error:", error);
+        logger.error({ err: error }, "OAuth server error");
         const pending = pendingAuthRequests.get(initialRequestId);
         if (pending) {
           clearTimeout(pending.timeout);
@@ -561,23 +563,82 @@ export class GitLabOAuth {
   }
 
   /**
+   * Get an access token from an external command.
+   */
+  private async getScriptToken(): Promise<TokenData> {
+    if (!this.config.tokenScript) {
+      throw new Error("OAuth token script is not configured");
+    }
+
+    const shell = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
+    const args = process.platform === "win32"
+      ? ["/d", "/s", "/c", this.config.tokenScript]
+      : ["-c", this.config.tokenScript];
+    const timeoutSeconds = Number.parseInt(process.env.GITLAB_OAUTH_TOKEN_SCRIPT_TIMEOUT_SECONDS || "30", 10);
+    const timeoutMs = (Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 30) * 1000;
+    const { stdout } = await execFileAsync(shell, args, {
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024,
+    });
+    const output = stdout.trim();
+
+    if (!output) {
+      throw new Error("OAuth token script produced no output");
+    }
+
+    let accessToken = output;
+    try {
+      const parsed = JSON.parse(output) as unknown;
+      if (typeof parsed === "string") {
+        accessToken = parsed;
+      } else if (parsed && typeof parsed === "object") {
+        const value = (parsed as { access_token?: unknown; token?: unknown }).access_token ??
+          (parsed as { token?: unknown }).token;
+        if (typeof value !== "string") {
+          throw new Error("OAuth token script JSON must include a string access_token or token field");
+        }
+        accessToken = value;
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("OAuth token script JSON")) {
+        throw error;
+      }
+      // Plain-token stdout is the common case.
+    }
+
+    if (!accessToken.trim()) {
+      throw new Error("OAuth token script returned an empty token");
+    }
+
+    return {
+      access_token: accessToken.trim(),
+      created_at: Date.now(),
+      token_type: "Bearer",
+    };
+  }
+
+  /**
    * Get a valid access token, refreshing if necessary
    */
-  async getAccessToken(): Promise<string> {
+  async getAccessToken(force = false): Promise<string> {
+    if (this.config.tokenScript) {
+      return (await this.getScriptToken()).access_token;
+    }
+
     let tokenData = this.loadToken();
 
-    // If no token or expired, start OAuth flow or refresh
+    // If no token or expired (or forced), start OAuth flow or refresh
     if (!tokenData) {
       logger.info("No stored token found. Starting OAuth flow...");
       tokenData = await this.startOAuthFlow();
-    } else if (this.isTokenExpired(tokenData)) {
-      logger.info("Token expired. Refreshing...");
+    } else if (force || this.isTokenExpired(tokenData)) {
+      logger.info(force && !this.isTokenExpired(tokenData) ? "Force-refreshing OAuth token..." : "Token expired. Refreshing...");
       if (tokenData.refresh_token) {
         try {
           tokenData = await this.refreshAccessToken(tokenData.refresh_token);
           this.saveToken(tokenData);
         } catch (error) {
-          logger.error("Token refresh failed. Starting new OAuth flow...", error);
+          logger.error({ err: error }, "Token refresh failed. Starting new OAuth flow...");
           tokenData = await this.startOAuthFlow();
         }
       } else {
@@ -599,7 +660,7 @@ export class GitLabOAuth {
         logger.info("Token cleared");
       }
     } catch (error) {
-      logger.error("Failed to clear token:", error);
+      logger.error({ err: error }, "Failed to clear token");
     }
   }
 
@@ -607,6 +668,10 @@ export class GitLabOAuth {
    * Check if a valid token exists
    */
   hasValidToken(): boolean {
+    if (this.config.tokenScript) {
+      return true;
+    }
+
     const tokenData = this.loadToken();
     if (!tokenData) {
       return false;
@@ -625,20 +690,22 @@ export async function initializeOAuthClient(gitlabUrl: string = "https://gitlab.
   const clientSecret = process.env.GITLAB_OAUTH_CLIENT_SECRET;
   const redirectUri = process.env.GITLAB_OAUTH_REDIRECT_URI || "http://127.0.0.1:8888/callback";
   const tokenStoragePath = process.env.GITLAB_OAUTH_TOKEN_PATH;
+  const tokenScript = process.env.GITLAB_OAUTH_TOKEN_SCRIPT;
 
-  if (!clientId) {
+  if (!clientId && !tokenScript) {
     throw new Error(
-      "GITLAB_OAUTH_CLIENT_ID environment variable is required for OAuth authentication"
+      "GITLAB_OAUTH_CLIENT_ID or GITLAB_OAUTH_TOKEN_SCRIPT environment variable is required for OAuth authentication"
     );
   }
 
   const oauth = new GitLabOAuth({
-    clientId,
+    clientId: clientId || "external-token-script",
     clientSecret,
     redirectUri,
     gitlabUrl,
     scopes: [process.env.GITLAB_READ_ONLY_MODE === "true" ? "read_api" : "api"],
     tokenStoragePath,
+    tokenScript,
   });
 
   // Single call: triggers browser flow if needed, or reads cached token

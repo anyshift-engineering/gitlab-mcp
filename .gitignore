@@ -5,6 +5,7 @@ build
 .env
 .env.local
 .env.test
+.secrets
 coverage/
 *.log
 # ai
@@ -12,3 +13,16 @@ coverage/
 .aider*
 .sisyphus
 test-results*.json
+test_results.txt
+test_out.txt
+docs/plans/
+.codex
+
+# AI agent worktrees (local development only)
+.claude/worktrees/
+# OpenWolf local context (session notes, anatomy, memory)
+.wolf/
+
+# MkDocs build artifacts
+site/
+.venv-docs/

@@ -29,6 +29,8 @@ export class MockGitLabServer {
   // Root-level dynamic router (for OAuth paths not under /api/v4)
   private rootRouter: express.Router;
   private rootHandlers = new Map<string, Handler>();
+  // In-memory store for mutable resources (issues, etc.)
+  private issueStore: Map<string, Record<string, any>> = new Map();
 
   constructor(config: MockGitLabConfig) {
     this.config = config;
@@ -180,6 +182,15 @@ export class MockGitLabServer {
         name: "Test User",
         email: "test@example.com",
         state: "active",
+      });
+    });
+
+    // GET /api/v4/version - GitLab instance version
+    this.app.get("/api/v4/version", (_req: AuthenticatedRequest, res: Response) => {
+      res.json({
+        version: "18.3.1-ee",
+        revision: "abc1234",
+        enterprise: true,
       });
     });
 
@@ -365,6 +376,12 @@ export class MockGitLabServer {
       (req: AuthenticatedRequest, res: Response) => {
         const issueIid = parseInt(req.params.issue_iid);
         const projectId = req.params.projectId;
+        const storeKey = `${projectId}:${issueIid}`;
+        const stored = this.issueStore.get(storeKey);
+        if (stored) {
+          res.json(stored);
+          return;
+        }
         res.json({
           id: issueIid,
           iid: issueIid,
@@ -385,8 +402,64 @@ export class MockGitLabServer {
           },
           assignees: [],
           labels: [],
-          milestone: null,
+          milestone:
+            issueIid === 100
+              ? {
+                  id: 42,
+                  iid: 7,
+                  title: "Sprint 42",
+                  description: "A very long milestone description ".repeat(50),
+                  state: "active",
+                  web_url: `https://gitlab.mock/project/${projectId}/milestones/7`,
+                }
+              : null,
         });
+      }
+    );
+
+    // PUT /api/v4/projects/:projectId/issues/:issue_iid - Update issue
+    this.app.put(
+      "/api/v4/projects/:projectId/issues/:issue_iid",
+      (req: AuthenticatedRequest, res: Response) => {
+        const issueIid = parseInt(req.params.issue_iid);
+        const projectId = req.params.projectId;
+        const storeKey = `${projectId}:${issueIid}`;
+
+        // Build response from stored data (if previously updated) or defaults
+        const stored = this.issueStore.get(storeKey) || {};
+        const description = (req.body?.description as string) ?? stored.description ?? `Description for issue ${issueIid}`;
+        const title = (req.body?.title as string) ?? stored.title ?? `Test Issue ${issueIid}`;
+        const state = (req.body?.state_event as string) === "close" ? "closed" :
+                      (req.body?.state_event as string) === "reopen" ? "opened" :
+                      (stored.state ?? "opened");
+
+        const updatedIssue = {
+          id: issueIid,
+          iid: issueIid,
+          project_id: projectId,
+          title,
+          description,
+          state,
+          created_at: stored.created_at ?? "2024-01-01T00:00:00Z",
+          updated_at: new Date().toISOString(),
+          closed_at: state === "closed" ? new Date().toISOString() : null,
+          web_url: `https://gitlab.mock/project/${projectId}/issues/${issueIid}`,
+          author: {
+            id: 1,
+            username: "test-user",
+            name: "Test User",
+            avatar_url: null,
+            web_url: "https://gitlab.mock/test-user",
+          },
+          assignees: [],
+          labels: [],
+          milestone: null,
+        };
+
+        // Store for subsequent GET requests
+        this.issueStore.set(storeKey, updatedIssue);
+
+        res.json(updatedIssue);
       }
     );
 
@@ -565,11 +638,16 @@ export class MockGitLabServer {
   }
 
   async start(): Promise<void> {
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
       this.server = this.app.listen(this.config.port, "127.0.0.1", () => {
+        const address = this.server?.address();
+        if (typeof address === "object" && address) {
+          this.config.port = address.port;
+        }
         console.log(`Mock GitLab API listening on http://127.0.0.1:${this.config.port}`);
         resolve();
       });
+      this.server.once("error", reject);
     });
   }
 
@@ -592,49 +670,19 @@ export class MockGitLabServer {
   getUrl(): string {
     return `http://127.0.0.1:${this.config.port}`;
   }
+
+  getPort(): number {
+    return this.config.port;
+  }
 }
 
 /**
- * Helper to find available port for mock server
+ * Helper to find available port for mock server (OS-assigned ephemeral port).
+ * Returns 0 to signal MockGitLabServer.start() to use OS-assigned port,
+ * avoiding TOCTOU race where another test grabs the port before binding.
  */
-export async function findMockServerPort(
-  basePort: number = 9000,
-  maxAttempts: number = 10
-): Promise<number> {
-  const net = await import("net");
-
-
-  const tryPort = async (port: number, attemptsLeft: number): Promise<number> => {
-    if (attemptsLeft === 0) {
-      throw new Error(
-        `Could not find available port after ${maxAttempts} attempts starting from ${basePort}`
-      );
-    }
-
-    return new Promise((resolve, reject) => {
-      const server = net.createServer();
-      server.unref();
-
-      server.on("error", async () => {
-        try {
-          const nextPort = await tryPort(port + 1, attemptsLeft - 1);
-          resolve(nextPort);
-        } catch (err) {
-          reject(err);
-        }
-      });
-
-      server.listen(port, "127.0.0.1", () => {
-        const addr = server.address();
-        const actualPort = typeof addr === "object" && addr ? addr.port : port;
-        server.close(() => {
-          resolve(actualPort);
-        });
-      });
-    });
-  };
-
-  return tryPort(basePort, maxAttempts);
+export async function findMockServerPort(): Promise<number> {
+  return 0;
 }
 
 /**
