@@ -30,21 +30,30 @@ const MCP_PORT_BASE = 3200;
 
 // Known tool counts per toolset (from TOOLSET_DEFINITIONS)
 const TOOLSET_TOOL_COUNTS: Record<string, number> = {
-  merge_requests: 34,
-  issues: 14,
+  merge_requests: 41,
+  issues: 24,
   repositories: 7,
-  branches: 4,
-  projects: 8,
+  branches: 15,
+  projects: 11,
   labels: 5,
+  ci: 4,
   pipelines: 19,
-  milestones: 9,
+  milestones: 17,
   wiki: 10,
   releases: 7,
-  users: 5,
+  tags: 5,
+  users: 7,
   search: 3,
-  workitems: 12,
+  workitems: 18,
   webhooks: 3,
+  groups: 1,
+  variables: 10,
+  dependency_proxy: 4,
+  vulnerabilities: 4,
 };
+
+const LEGACY_PIPELINE_CI_TOOL_COUNT = 2;
+const LEGACY_PIPELINE_TOOL_COUNT = TOOLSET_TOOL_COUNTS.pipelines + LEGACY_PIPELINE_CI_TOOL_COUNT;
 
 const DEFAULT_TOOLSETS = [
   "merge_requests",
@@ -53,40 +62,58 @@ const DEFAULT_TOOLSETS = [
   "branches",
   "projects",
   "labels",
+  "ci",
+  "users",
+  "groups",
+];
+
+const NON_DEFAULT_TOOLSETS = [
   "pipelines",
   "milestones",
   "wiki",
   "releases",
-  "users",
+  "tags",
+  "workitems",
+  "webhooks",
+  "search",
+  "variables",
+  "dependency_proxy",
+  "vulnerabilities",
 ];
 
-const NON_DEFAULT_TOOLSETS = ["search", "webhooks"];
+// discover_tools meta-tool is always force-injected (Step 5.5)
+const DISCOVER_TOOLS_COUNT = 1;
 
 const DEFAULT_TOOL_COUNT = DEFAULT_TOOLSETS.reduce(
   (sum, id) => sum + TOOLSET_TOOL_COUNTS[id],
   0
-);
+) + DISCOVER_TOOLS_COUNT;
 
 const ALL_TOOLSET_TOOL_COUNT = Object.values(TOOLSET_TOOL_COUNTS).reduce(
   (sum, c) => sum + c,
   0
-);
+) + DISCOVER_TOOLS_COUNT;
 
 // Representative tools per toolset for spot-checking
 const TOOLSET_SAMPLE_TOOLS: Record<string, string[]> = {
   merge_requests: ["merge_merge_request", "create_merge_request_thread", "list_draft_notes"],
-  issues: ["create_issue", "list_issues", "create_note"],
+  issues: ["create_issue", "list_issues", "create_note", "list_todos"],
   repositories: ["search_repositories", "get_file_contents", "push_files"],
-  branches: ["create_branch", "list_commits"],
-  projects: ["get_project", "list_namespaces", "list_group_iterations"],
+  branches: ["create_branch", "get_branch", "list_branches", "delete_branch", "list_commits", "list_commit_statuses", "create_commit_status"],
+  projects: ["get_project", "update_project", "list_namespaces", "list_group_iterations"],
   labels: ["list_labels", "create_label"],
+  ci: ["validate_ci_lint", "validate_project_ci_lint", "list_ci_catalog_resources", "get_ci_catalog_resource"],
   pipelines: ["list_pipelines", "create_pipeline", "cancel_pipeline_job", "list_deployments", "list_job_artifacts"],
-  milestones: ["list_milestones", "create_milestone", "get_milestone_burndown_events"],
+  milestones: ["list_milestones", "create_milestone", "list_group_milestones", "get_group_milestone_burndown_events"],
   wiki: ["list_wiki_pages", "create_wiki_page", "list_group_wiki_pages", "create_group_wiki_page"],
   releases: ["list_releases", "create_release", "download_release_asset"],
+  tags: ["list_tags", "create_tag", "get_tag_signature"],
   users: ["get_users", "upload_markdown", "download_attachment"],
   search: ["search_code", "search_project_code", "search_group_code"],
   webhooks: ["list_webhooks", "list_webhook_events", "get_webhook_event"],
+  groups: ["create_group"],
+  variables: ["list_project_variables", "create_project_variable", "delete_project_variable", "list_group_variables", "create_group_variable", "delete_group_variable"],
+  dependency_proxy: ["get_dependency_proxy_settings", "list_dependency_proxy_blobs", "purge_dependency_proxy_cache"],
 };
 
 // --- Helpers ---
@@ -143,7 +170,7 @@ async function nextMcpPort(): Promise<number> {
 
 describe("Toolset Filtering", { concurrency: 1 }, () => {
   before(async () => {
-    const mockPort = await findMockServerPort(MOCK_PORT_BASE);
+    const mockPort = await findMockServerPort();
     mockGitLab = new MockGitLabServer({
       port: mockPort,
       validTokens: [MOCK_TOKEN],
@@ -181,8 +208,10 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
       }
     });
 
-    test("excludes non-default toolsets (search)", () => {
+    test("excludes non-default toolsets (search, pipelines, wiki)", () => {
       assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.search, "non-default search");
+      assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.pipelines, "non-default pipelines");
+      assertContainsNone(tools, TOOLSET_SAMPLE_TOOLS.wiki, "non-default wiki");
     });
 
     test("excludes execute_graphql (not in any toolset)", () => {
@@ -206,8 +235,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns only issue tools", () => {
-      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues);
+    test("returns only issue tools + discover_tools", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + DISCOVER_TOOLS_COUNT);
     });
 
     test("includes issue sample tools", () => {
@@ -266,16 +295,16 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns default tools plus execute_graphql (list_pipelines already in default)", () => {
-      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + 1);
+    test("returns default tools plus list_pipelines and execute_graphql (both not in default toolsets)", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + 2);
     });
 
     test("includes the individually added tools", () => {
       assertContainsAll(tools, ["list_pipelines", "execute_graphql"], "individual");
     });
 
-    test("includes pipeline tools from default toolset", () => {
-      assertContainsAll(tools, ["create_pipeline", "cancel_pipeline"], "default pipelines");
+    test("excludes other pipeline tools (not individually enabled)", () => {
+      assertContainsNone(tools, ["create_pipeline", "cancel_pipeline"], "non-enabled pipelines");
     });
   });
 
@@ -296,8 +325,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns issue tools + 2 individual pipeline tools", () => {
-      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + 2);
+    test("returns issue tools + 2 individual pipeline tools + discover_tools", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + 2 + DISCOVER_TOOLS_COUNT);
     });
 
     test("includes issue tools and the two pipeline tools", () => {
@@ -327,10 +356,10 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns issue tools + all pipeline tools", () => {
+    test("returns issue tools + all pipeline tools + discover_tools", () => {
       assert.strictEqual(
         tools.length,
-        TOOLSET_TOOL_COUNTS.issues + TOOLSET_TOOL_COUNTS.pipelines
+        TOOLSET_TOOL_COUNTS.issues + LEGACY_PIPELINE_TOOL_COUNT + DISCOVER_TOOLS_COUNT
       );
     });
 
@@ -355,8 +384,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns default tool count (wiki is already default)", () => {
-      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT);
+    test("returns default tools + wiki tools (wiki is NOT default, USE_GITLAB_WIKI adds it)", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + TOOLSET_TOOL_COUNTS.wiki);
     });
 
     test("includes wiki tools", () => {
@@ -378,17 +407,27 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
       "list_issue_links",
       "list_issue_discussions",
       "get_issue_link",
+      "list_todos",
+      "list_issue_emoji_reactions",
+      "list_issue_note_emoji_reactions",
     ];
 
     const writeIssueTools = [
       "create_issue",
       "update_issue",
+      "update_issue_description_patch",
       "delete_issue",
+      "mark_todo_done",
+      "mark_all_todos_done",
       "create_issue_note",
       "update_issue_note",
       "create_issue_link",
       "delete_issue_link",
       "create_note",
+      "create_issue_emoji_reaction",
+      "delete_issue_emoji_reaction",
+      "create_issue_note_emoji_reaction",
+      "delete_issue_note_emoji_reaction",
     ];
 
     before(async () => {
@@ -410,8 +449,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
       assertContainsNone(tools, writeIssueTools, "write issues");
     });
 
-    test("returns correct count", () => {
-      assert.strictEqual(tools.length, readOnlyIssueTools.length);
+    test("returns correct count (read-only issues + discover_tools)", () => {
+      assert.strictEqual(tools.length, readOnlyIssueTools.length + DISCOVER_TOOLS_COUNT);
     });
   });
 
@@ -505,8 +544,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns exactly pipeline tool count (no duplicates)", () => {
-      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.pipelines);
+    test("returns exactly pipeline tool count + discover_tools (no duplicates)", () => {
+      assert.strictEqual(tools.length, LEGACY_PIPELINE_TOOL_COUNT + DISCOVER_TOOLS_COUNT);
     });
   });
 
@@ -527,8 +566,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns exactly issue tool count (no duplicates)", () => {
-      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues);
+    test("returns exactly issue tool count + discover_tools (no duplicates)", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + DISCOVER_TOOLS_COUNT);
     });
   });
 
@@ -548,8 +587,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
 
     after(() => cleanupServers([server]));
 
-    test("returns only issue tools (invalid toolset ignored)", () => {
-      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues);
+    test("returns only issue tools + discover_tools (invalid toolset ignored)", () => {
+      assert.strictEqual(tools.length, TOOLSET_TOOL_COUNTS.issues + DISCOVER_TOOLS_COUNT);
     });
   });
 
@@ -573,8 +612,8 @@ describe("Toolset Filtering", { concurrency: 1 }, () => {
       assertContainsAll(tools, ["list_pipelines", "execute_graphql"], "case-insensitive tools");
     });
 
-    test("returns default tools plus execute_graphql (list_pipelines already in default)", () => {
-      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + 1);
+    test("returns default tools plus list_pipelines and execute_graphql", () => {
+      assert.strictEqual(tools.length, DEFAULT_TOOL_COUNT + 2);
     });
   });
 

@@ -15,9 +15,20 @@ OAuth2 provides several advantages over personal access tokens:
 
 - A GitLab account (GitLab.com or self-hosted GitLab instance)
 - Node.js installed on your machine
-- The GitLab MCP server installed
+- The GitLab MCP server installed:
 
-> ⚠️ **Important**: OAuth is designed for **local/desktop environments** (e.g., Claude Desktop, VS Code). For **Docker deployments**, use [Personal Access Token](../README.md#using-personal-access-token-traditional) instead, as OAuth requires browser-based authentication and a local callback server which does not work properly in containerized environments.
+  ```bash
+  brew tap zereight/gitlab-mcp https://github.com/zereight/gitlab-mcp
+  brew install zereight/gitlab-mcp/zereight-mcp-gitlab
+  ```
+
+  Or with npm:
+
+  ```bash
+  npm install -g @zereight/mcp-gitlab
+  ```
+
+> ⚠️ **Important**: OAuth is designed for **local/desktop environments** (e.g., Claude Desktop, VS Code). For **Docker deployments**, use [Personal Access Token](https://github.com/zereight/gitlab-mcp/blob/main/README.md#using-personal-access-token-traditional) instead, as OAuth requires browser-based authentication and a local callback server which does not work properly in containerized environments.
 
 ## Step 1: Create a GitLab OAuth Application
 
@@ -29,7 +40,7 @@ OAuth2 provides several advantages over personal access tokens:
    - Select **Settings** (or **Preferences**)
    - In the left sidebar, click **Applications**
 
-   ![alt text](<./img/step 2.png>)
+   ![alt text](<../img/step 2.png>)
 
 3. **Create a new application**:
 
@@ -44,7 +55,7 @@ OAuth2 provides several advantages over personal access tokens:
      - **Scopes**: Select the following scope:
        - `api` - Grants complete read/write access to the API (includes all necessary permissions)
 
-   ![alt text](<./img/step 3.png>)
+   ![alt text](<../img/step 3.png>)
 
 4. **Save the application**:
 
@@ -52,8 +63,8 @@ OAuth2 provides several advantages over personal access tokens:
    - **Important**: Copy the **Application ID** - you'll need this as your `GITLAB_OAUTH_CLIENT_ID`
    - **For Confidential apps**: Also copy the **Secret** - you'll need this as `GITLAB_OAUTH_CLIENT_SECRET`
 
-   ![alt text](<./img/step 4.png>)
-   ![alt text](<./img/step 5.png>)
+   ![alt text](<../img/step 4.png>)
+   ![alt text](<../img/step 5.png>)
 
 ## Step 2: Configure the MCP Server
 
@@ -73,8 +84,7 @@ Add or update the GitLab MCP server configuration:
 {
   "mcpServers": {
     "gitlab": {
-      "command": "npx",
-      "args": ["-y", "@zereight/mcp-gitlab"],
+      "command": "zereight-mcp-gitlab",
       "env": {
         "GITLAB_USE_OAUTH": "true",
         "GITLAB_OAUTH_CLIENT_ID": "your_application_id_here",
@@ -97,8 +107,7 @@ If you're using a self-hosted GitLab instance, update the `GITLAB_API_URL`:
 {
   "mcpServers": {
     "gitlab": {
-      "command": "npx",
-      "args": ["-y", "@zereight/mcp-gitlab"],
+      "command": "zereight-mcp-gitlab",
       "env": {
         "GITLAB_USE_OAUTH": "true",
         "GITLAB_OAUTH_CLIENT_ID": "your_application_id_here",
@@ -156,6 +165,20 @@ The MCP server automatically handles token refresh:
 - Checks token expiry before each API request
 - Automatically refreshes the token if it's expired (or will expire within 5 minutes)
 - If refresh fails, it will restart the OAuth flow
+
+## External Token Script
+
+If another tool already manages OAuth credentials, let gitlab-mcp ask that tool
+for a token:
+
+```bash
+GITLAB_USE_OAUTH=true \
+GITLAB_OAUTH_TOKEN_SCRIPT="coder external-auth access-token gitlab"
+```
+
+The script must print an access token to stdout. JSON output with an
+`access_token` or `token` field is also accepted. When this is set, gitlab-mcp
+skips the browser flow and token file refresh.
 
 ## Using a Different Port
 
